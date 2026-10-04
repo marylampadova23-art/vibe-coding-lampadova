@@ -163,49 +163,27 @@ name,department,format,date,owner
 
 Для чтения и проверки CSV используется стандартный модуль `csv`.
 
-```python
-with TRAININGS_PATH.open("r", encoding="utf-8-sig", newline="") as csv_file:
-    reader = csv.DictReader(csv_file)
+Файл открывается через `TRAININGS_PATH.open(...)`, после чего данные считываются с помощью `csv.DictReader`.
 
-    fieldnames = [name.strip() for name in reader.fieldnames]
-    missing = [
-        name for name in REQUIRED_TRAINING_COLUMNS
-        if name not in fieldnames
-    ]
+Затем бот проверяет, что в CSV присутствуют обязательные столбцы из списка `REQUIRED_TRAINING_COLUMNS`.
 
-Поиск обучения выполняется без учёта регистра и поддерживает частичное совпадение:
-query_folded = query.casefold()
+Для поиска обучения используется сравнение без учёта регистра:
 
-found = [
-    item
-    for item in trainings
-    if query_folded in item["name"].casefold()
-]
+`query.casefold()`
 
-Для фильтрации по подразделению также используется сравнение без учёта регистра:
-department_folded = department.casefold()
+Поиск выполняется по условию:
 
-found = [
-    item
-    for item in trainings
-    if item["department"].casefold() == department_folded
-]
+`query_folded in item["name"].casefold()`
 
-Ошибки чтения CSV перехватываются и превращаются в понятное сообщение пользователю:
-try:
-    trainings = load_trainings()
-except TrainingDataError as error:
-    await update.effective_message.reply_text(
-        f"Не удалось прочитать каталог обучений: {error}"
-    )
-    return
+Благодаря этому запрос `/training адаптация` может найти обучение «Адаптация новых сотрудников».
 
+Для фильтрации по подразделению также применяется `casefold()`:
 
-Это реальные фрагменты логики нашего `bot.py`, а не просто пример.
+`item["department"].casefold() == department.casefold()`
 
-Сохрани через **Control + O → Enter → Control + X**.
+Ошибки чтения CSV обрабатываются через `try/except`.
 
-После этого останется ещё один совсем маленький формальный штрих — добавим в тестирование **примеры «запрос → ответ»**, потому что это тоже прямо указано в требованиях. После этих двух правок я бы считала отчёт на 100% закрытым.
+При возникновении `TrainingDataError` бот отправляет пользователю понятное сообщение об ошибке и продолжает работу вместо завершения программы.
 
 ### Обработка ошибок
 
