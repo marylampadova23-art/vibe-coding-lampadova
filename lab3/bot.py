@@ -2,7 +2,8 @@
 
 Python 3.9+; python-telegram-bot==21.11.1; python-dotenv==1.1.1.
 Запуск: python bot.py (из активированного виртуального окружения).
-BOT_TOKEN и ADMIN_ID берутся из .env рядом с этим файлом.
+BOT_TOKEN и ADMIN_ID берутся из переменных окружения или .env рядом с этим файлом.
+DATA_DIR может указывать на Railway Volume для постоянного хранения SQLite.
 Каталог обучений читается из trainings.csv рядом с bot.py.
 """
 
@@ -18,10 +19,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from telegram import BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.error import Conflict, InvalidToken, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -29,16 +38,13 @@ from telegram.ext import (
     filters,
 )
 
-# Все локальные файлы ищем рядом с bot.py, независимо от текущей папки Terminal.
+# Код и CSV ищем рядом с bot.py. База может храниться на Railway Volume.
 BASE_DIR = Path(__file__).resolve().parent
-
-# Локально база хранится рядом с bot.py.
-# В облаке DATA_DIR можно направить на постоянный диск.
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 DB_PATH = DATA_DIR / "feedback.db"
 TRAININGS_PATH = BASE_DIR / "trainings.csv"
+
 TRAINING, RATING, COMMENT = range(3)
 MAX_TRAINING = 120
 MAX_COMMENT = 1500
@@ -62,7 +68,7 @@ HELP_TEXT = (
     "/skip — пропустить комментарий на последнем шаге\n"
     "/report — отчёт, только для руководителя\n\n"
     "Каталог обучений из CSV:\n"
-    "/trainings — показать все обучения\n"
+    "/trainings — выбрать подразделение кнопками и посмотреть каталог\n"
     "/training <название> — найти обучение по названию\n"
     "/department <отдел> — показать обучения подразделения\n\n"
     "Дополнительно:\n"
@@ -170,13 +176,6 @@ def load_trainings() -> List[Dict[str, str]]:
                         )
                     )
 
-                try:
-                    datetime.strptime(row["date"], "%Y-%m-%d")
-                except ValueError:
-                    raise TrainingDataError(
-                        "В строке {} дата должна быть в формате YYYY-MM-DD.".format(line_number)
-                    )
-
                 trainings.append(row)
     except UnicodeDecodeError:
         raise TrainingDataError("Не удалось прочитать trainings.csv как UTF-8 файл.")
@@ -188,6 +187,31 @@ def load_trainings() -> List[Dict[str, str]]:
     return trainings
 
 
+RU_MONTHS = {
+    1: "января",
+    2: "февраля",
+    3: "марта",
+    4: "апреля",
+    5: "мая",
+    6: "июня",
+    7: "июля",
+    8: "августа",
+    9: "сентября",
+    10: "октября",
+    11: "ноября",
+    12: "декабря",
+}
+
+
+def format_training_date(value: str) -> str:
+    """Преобразует YYYY-MM-DD в привычный русский формат; иначе возвращает исходное значение."""
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return value
+    return "{} {} {} года".format(parsed.day, RU_MONTHS[parsed.month], parsed.year)
+
+
 def format_training(item: Dict[str, str]) -> str:
     return (
         "Обучение: {name}\n"
@@ -195,21 +219,104 @@ def format_training(item: Dict[str, str]) -> str:
         "Формат: {format}\n"
         "Дата: {date}\n"
         "Ответственный: {owner}"
-    ).format(**item)
+    ).format(
+        name=item["name"],
+        department=item["department"],
+        format=item["format"],
+        date=format_training_date(item["date"]),
+        owner=item["owner"],
+    )
+
+
+def training_departments(trainings: List[Dict[str, str]]) -> List[str]:
+    """Возвращает уникальные подразделения из CSV в стабильном порядке."""
+    return sorted({item["department"] for item in trainings}, key=str.casefold)
+
+
+def department_keyboard(trainings: List[Dict[str, str]]) -> InlineKeyboardMarkup:
+    """Создаёт inline-кнопки по подразделениям, реально присутствующим в CSV."""
+    departments = training_departments(trainings)
+    rows = []
+    current_row = []
+    for index, department in enumerate(departments):
+        current_row.append(
+            InlineKeyboardButton(department, callback_data="catalog:dept:{}".format(index))
+        )
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    rows.append([InlineKeyboardButton("Все обучения", callback_data="catalog:all")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_training_catalog(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    trainings: List[Dict[str, str]],
+    title: str,
+) -> None:
+    parts = ["{} ({}):".format(title, len(trainings))]
+    for index, item in enumerate(trainings, start=1):
+        parts.append("\n{}. {}".format(index, format_training(item)))
+    await send_long(context.bot, chat_id, "\n".join(parts))
 
 
 async def trainings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает весь каталог обучений из CSV."""
+    """Показывает кнопки подразделений вместо длинного каталога одним сообщением."""
     try:
         trainings = load_trainings()
     except TrainingDataError as error:
         await update.effective_message.reply_text("Не удалось прочитать каталог обучений: {}".format(error))
         return
 
-    parts = ["Доступные обучения ({}):".format(len(trainings))]
-    for index, item in enumerate(trainings, start=1):
-        parts.append("\n{}. {}".format(index, format_training(item)))
-    await send_long(context.bot, update.effective_chat.id, "\n".join(parts))
+    await update.effective_message.reply_text(
+        "Выберите подразделение или покажите весь каталог:",
+        reply_markup=department_keyboard(trainings),
+    )
+
+
+async def trainings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает inline-кнопки команды /trainings."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    try:
+        trainings = load_trainings()
+    except TrainingDataError as error:
+        await query.edit_message_text("Не удалось прочитать каталог обучений: {}".format(error))
+        return
+
+    data = query.data or ""
+    if data == "catalog:all":
+        selected = trainings
+        title = "Все доступные обучения"
+    elif data.startswith("catalog:dept:"):
+        try:
+            index = int(data.rsplit(":", 1)[1])
+            departments = training_departments(trainings)
+            department = departments[index]
+        except (ValueError, IndexError):
+            await query.edit_message_text(
+                "Каталог изменился. Отправьте /trainings ещё раз и выберите подразделение заново."
+            )
+            return
+        selected = [
+            item for item in trainings
+            if item["department"].casefold() == department.casefold()
+        ]
+        title = "Обучения подразделения «{}»".format(department)
+    else:
+        await query.edit_message_text("Неизвестный вариант. Отправьте /trainings ещё раз.")
+        return
+
+    await query.edit_message_text(
+        "Выбрано: {}. Чтобы выбрать другой вариант, снова отправьте /trainings.".format(title)
+    )
+    await send_training_catalog(context, query.message.chat_id, selected, title)
 
 
 async def training_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -556,7 +663,7 @@ async def wrong_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def outside_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Чтобы оставить отзыв, отправьте /feedback. Каталог обучений: /trainings. "
+        "Чтобы оставить отзыв, отправьте /feedback. Каталог с кнопками: /trainings. "
         "Список команд: /help.",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -655,6 +762,7 @@ def make_application(token: str, admin_id: Optional[int]) -> Application:
     )
 
     app.add_handler(conversation)
+    app.add_handler(CallbackQueryHandler(trainings_callback, pattern=r"^catalog:"))
     for handler in common_commands:
         app.add_handler(handler)
     app.add_handler(MessageHandler(PRIVATE & filters.COMMAND, wrong_command))
@@ -675,7 +783,7 @@ def main() -> None:
     try:
         init_db()
         app = make_application(token, admin_id)
-        app.run_polling(allowed_updates=["message"], drop_pending_updates=False)
+        app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=False)
     except InvalidToken:
         LOG.error("Telegram не принял токен. Проверьте BOT_TOKEN в .env. Не присылайте токен в чат.")
     except NetworkError:
